@@ -54,6 +54,12 @@ captures/
 *.aab
 *.aar
 
+# Windows precompiled executables (PyInstaller / go build artifacts)
+# LuckyStar.exe, LuckyStarMcp.exe 由 windows/build_executables.py 打包生成
+# go_client/LuckyStar.exe 由 windows/go_client/build.ps1 (go build) 生成
+windows/*.exe
+windows/go_client/*.exe
+
 # Common OS junk
 .DS_Store
 Thumbs.db
@@ -61,6 +67,9 @@ Thumbs.db
 # android root-level binaries
 android/*.a
 android/*.so
+
+# Generated driver installer (packer.sh embeds base64 .ko into this script)
+install_driver.sh
 
 # Downloaded cloudflared payload embedded into LS_KTool at build time
 android/jni/assets/cloudflared-linux-arm64
