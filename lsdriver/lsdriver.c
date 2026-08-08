@@ -532,9 +532,9 @@ static int __init lsdriver_init(void)
 
     // print_el2_status(); // 输出Hypervisor相关信息
 
-    bypass_cfi(); // 先尝试绕过 5系的cfi
+    // bypass_cfi(); // 先尝试绕过 5系的cfi
 
-    hide_myself(); // 隐藏内核模块本身
+    // hide_myself(); // 隐藏内核模块本身
 
     allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
 
@@ -556,8 +556,8 @@ static int __init lsdriver_init(void)
     do_exit_init();
 
     // 隐藏内核线程
-    hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
-    hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
+    // hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
+    // hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
 
     return 0;
 }
