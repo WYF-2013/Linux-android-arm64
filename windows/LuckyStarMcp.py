@@ -569,6 +569,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Expose the NativeHttpBridge Android bridge as an MCP server.",
     )
     parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="streamable-http",
+        help="MCP transport mode. Use 'stdio' when launched directly by an MCP client (e.g. ZCode).",
+    )
+    parser.add_argument(
         "--mcp-host",
         default=DEFAULT_MCP_BIND_HOST,
         help="Bind host for the local MCP web server.",
@@ -607,8 +613,11 @@ def _format_http_endpoint(host: str, port: int, path: str) -> str:
 
 
 def _emit_startup_info(runtime: dict[str, Any]) -> None:
-    print("[MCP] Server started:", file=sys.stderr, flush=True)
-    print(f"  Streamable HTTP: {runtime['streamable_http_url']}", file=sys.stderr, flush=True)
+    if runtime["transport"] == "stdio":
+        print("[MCP] Server started: stdio mode", file=sys.stderr, flush=True)
+    else:
+        print("[MCP] Server started:", file=sys.stderr, flush=True)
+        print(f"  Streamable HTTP: {runtime['streamable_http_url']}", file=sys.stderr, flush=True)
 
 
 def _configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
@@ -617,17 +626,19 @@ def _configure_runtime(args: argparse.Namespace) -> dict[str, Any]:
         timeout_seconds=args.android_timeout,
     )
 
-    mcp.settings.host = args.mcp_host.strip() or DEFAULT_MCP_BIND_HOST
-    mcp.settings.port = int(args.mcp_port)
-    mcp.settings.streamable_http_path = _normalize_http_path(args.mcp_path)
+    runtime: dict[str, Any] = {"transport": args.transport}
 
-    return {
-        "streamable_http_url": _format_http_endpoint(
+    if args.transport == "streamable-http":
+        mcp.settings.host = args.mcp_host.strip() or DEFAULT_MCP_BIND_HOST
+        mcp.settings.port = int(args.mcp_port)
+        mcp.settings.streamable_http_path = _normalize_http_path(args.mcp_path)
+        runtime["streamable_http_url"] = _format_http_endpoint(
             mcp.settings.host,
             mcp.settings.port,
             mcp.settings.streamable_http_path,
-        ),
-    }
+        )
+
+    return runtime
 
 
 def main() -> int:
@@ -635,7 +646,7 @@ def main() -> int:
     args = parser.parse_args()
     runtime = _configure_runtime(args)
     _emit_startup_info(runtime)
-    mcp.run(transport="streamable-http")
+    mcp.run(transport=args.transport)
     return 0
 
 
