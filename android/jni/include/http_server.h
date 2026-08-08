@@ -2,20 +2,12 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <nlohmann/json.hpp>
-#include <sched.h>
-#include <sys/mount.h>
 #include "BS_thread_pool.hpp"
 #include "memory_tool.h"
 
 // ============================================================================
 // HTTP 服务器模块
 // ============================================================================
-
-extern "C"
-{
-    extern const unsigned char cloudflared_blob_start[];
-    extern const unsigned char cloudflared_blob_end[];
-}
 
 namespace
 {
@@ -25,8 +17,6 @@ namespace
     constexpr int kListenBacklog = 32;
     constexpr std::size_t kMaxHttpHeaderBytes = 64 * 1024;
     constexpr std::size_t kMaxHttpBodyBytes = 16 * 1024 * 1024;
-    constexpr std::string_view kCloudflaredPath = "/data/akernel/.cloudflared";
-    constexpr std::string_view kCloudflaredTempPath = "/data/akernel/.cloudflared.tmp";
     std::mutex gRequestMutex;
 
     // 延迟创建，避免 daemonize() 的 fork() 丢弃线程池工作线程后留下不可用的任务队列。
@@ -82,126 +72,6 @@ namespace
         freeifaddrs(interfaces);
 
         if (!found) LS_LOGW_TAG_FMT("HTTP", "未检测到局域网 IPv4 地址，HTTP 服务仍监听 http://0.0.0.0:{}", kServerPort);
-    }
-
-    bool WritePrivateEtcFile(const char *path, std::string_view content)
-    {
-        const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0) return false;
-
-        std::size_t written = 0;
-        while (written < content.size())
-        {
-            const ssize_t result = write(fd, content.data() + written, content.size() - written);
-            if (result < 0)
-            {
-                if (errno == EINTR) continue;
-                close(fd);
-                return false;
-            }
-            if (result == 0)
-            {
-                close(fd);
-                return false;
-            }
-            written += static_cast<std::size_t>(result);
-        }
-
-        return close(fd) == 0;
-    }
-
-    bool ConfigureCloudflaredDns()
-    {
-        if (unshare(CLONE_NEWNS) != 0) return false;
-        if (mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) return false;
-        if (mount("tmpfs", "/system/etc", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,size=64k") != 0) return false;
-
-        constexpr std::string_view resolvConf = "nameserver 1.1.1.1\n"
-                                                "nameserver 8.8.8.8\n"
-                                                "options timeout:2 attempts:2\n";
-        constexpr std::string_view hosts = "127.0.0.1 localhost\n"
-                                           "::1 ip6-localhost\n";
-
-        if (!WritePrivateEtcFile("/system/etc/resolv.conf", resolvConf)) return false;
-        if (!WritePrivateEtcFile("/system/etc/hosts", hosts)) return false;
-        return setenv("SSL_CERT_DIR", "/apex/com.android.conscrypt/cacerts", 1) == 0;
-    }
-
-    bool ExtractCloudflared()
-    {
-        const std::size_t blobSize = static_cast<std::size_t>(cloudflared_blob_end - cloudflared_blob_start);
-        if (blobSize == 0) return false;
-
-        const int fd = open(kCloudflaredTempPath.data(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
-        if (fd < 0)
-        {
-            printErrno("创建 cloudflared 临时文件失败");
-            return false;
-        }
-
-        std::size_t written = 0;
-        while (written < blobSize)
-        {
-            const ssize_t result = write(fd, cloudflared_blob_start + written, blobSize - written);
-            if (result < 0)
-            {
-                if (errno == EINTR) continue;
-                printErrno("释放 cloudflared 失败");
-                close(fd);
-                unlink(kCloudflaredTempPath.data());
-                return false;
-            }
-            if (result == 0)
-            {
-                close(fd);
-                unlink(kCloudflaredTempPath.data());
-                return false;
-            }
-            written += static_cast<std::size_t>(result);
-        }
-
-        if (fchmod(fd, 0700) != 0)
-        {
-            printErrno("设置 cloudflared 权限失败");
-            close(fd);
-            unlink(kCloudflaredTempPath.data());
-            return false;
-        }
-        close(fd);
-
-        if (rename(kCloudflaredTempPath.data(), kCloudflaredPath.data()) != 0)
-        {
-            printErrno("安装 cloudflared 失败");
-            unlink(kCloudflaredTempPath.data());
-            return false;
-        }
-        return true;
-    }
-
-    void StartCloudflared()
-    {
-        if (!ExtractCloudflared()) return;
-
-        const pid_t pid = fork();
-        if (pid < 0)
-        {
-            printErrno("启动 cloudflared 失败");
-            unlink(kCloudflaredPath.data());
-            return;
-        }
-        if (pid == 0)
-        {
-            prctl(PR_SET_PDEATHSIG, SIGTERM);
-            if (!ConfigureCloudflaredDns())
-            {
-                printErrno("配置 cloudflared 私有 DNS 失败");
-                _exit(126);
-            }
-            execl(kCloudflaredPath.data(), kCloudflaredPath.data(), "tunnel", "--no-autoupdate", "--edge-ip-version", "4", "--url", "http://127.0.0.1:9494", static_cast<char *>(nullptr));
-            _exit(127);
-        }
-
-        LS_LOGI_TAG_FMT("HTTP", "cloudflared Tunnel 已启动，PID={}，公网地址将写入 /sdcard/log.txt", pid);
     }
 
     // 去除字符串末尾换行符
@@ -1875,7 +1745,6 @@ int http_server()
 
     LS_LOGI_TAG_FMT("HTTP", "服务端已监听 http://0.0.0.0:{}", kServerPort);
     PrintLanHttpAddresses();
-    StartCloudflared();
 
     for (;;)
     {

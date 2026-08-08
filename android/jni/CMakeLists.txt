@@ -31,7 +31,7 @@ endif ()
 #  注意: 本工程保留 -fexceptions / -frtti (Android.mk 显式开启 -fexceptions,
 #        memory_tool.h 依赖 <exception>)。
 # ============================================================================
-foreach (_lang C CXX ASM)
+foreach (_lang C CXX)
     string(REGEX REPLACE "(^| )-funwind-tables( |$)" "\\1\\2" CMAKE_${_lang}_FLAGS "${CMAKE_${_lang}_FLAGS}")
     string(REGEX REPLACE "(^| )-fstack-protector-strong( |$)" "\\1\\2" CMAKE_${_lang}_FLAGS "${CMAKE_${_lang}_FLAGS}")
     string(REGEX REPLACE "(^| )-D_FORTIFY_SOURCE=2( |$)" "\\1\\2" CMAKE_${_lang}_FLAGS "${CMAKE_${_lang}_FLAGS}")
@@ -41,7 +41,7 @@ foreach (_lang C CXX ASM)
 endforeach ()
 unset(_lang)
 
-project(LS_KTool LANGUAGES C CXX ASM)
+project(LS_KTool LANGUAGES C CXX)
 
 # C++ 标准设置为 C++26 (保留原 Android.mk 的 -std=c++26)。
 # 注意: CMake < 3.25 不识别 "CXX26" dialect, 在 project() 期间就会因
@@ -161,7 +161,6 @@ set(LS_DEBUG_LOG 1 CACHE STRING "Enable LS_LOGD debug logging (1=on, 0=off)")
 # 主程序源文件 (对应 FILE_LIST)
 set(LS_KTOOL_SOURCES
     src/main.cpp
-    src/cloudflared_blob.S
     # imgui 核心与后端通过链接 imgui 静态库引入, 此处不再重复列
 )
 
@@ -175,21 +174,9 @@ target_compile_definitions(LS_KTool PRIVATE
 # 强制包含 logger.h —— 对应 Android.mk 的
 # LOCAL_CPPFLAGS += -include $(SHARED_JNI_ROOT)/include/logger.h
 # (SHARED_JNI_ROOT 在 ndk-build 下即 jni 目录, 等价于此处)
-# 注意: 必须用 $<COMPILE_LANGUAGE:CXX> 限定, 否则 -include 也会传给
-# cloudflared_blob.S 的汇编器, 导致汇编器试图预处理 C 头文件而报错
-# (原 Android.mk 的 LOCAL_ASFLAGS 与 LOCAL_CPPFLAGS 是分开的, -include 只在后者)。
 target_compile_options(LS_KTool PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-include>
     $<$<COMPILE_LANGUAGE:CXX>:${CMAKE_CURRENT_SOURCE_DIR}/include/logger.h>
-)
-
-# cloudflared_blob.S 用 .incbin "assets/cloudflared-linux-arm64" 引用资源,
-# 相对路径以 jni 目录为根。clang 汇编 .S 文件时的工作目录即源文件所在,
-# 但 .incbin 的搜索路径默认是 -I 传入的 include 目录。这里只给汇编文件
-# 加 jni 根目录作为 include 路径 (对应 Android.mk 的 LOCAL_ASFLAGS += -I$(LOCAL_PATH)),
-# 不继承 target 的其他 -I (避免汇编器解析系统头)。
-set_source_files_properties(src/cloudflared_blob.S PROPERTIES
-    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # 头文件搜索路径 (对应 Android.mk 的 LOCAL_C_INCLUDES)

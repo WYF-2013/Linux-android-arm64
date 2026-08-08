@@ -2,9 +2,6 @@
 /.cxx/
 /build/
 
-# cloudflared payload embedded into LS_KTool at build time (downloaded)
-/jni/assets/cloudflared-linux-arm64
-
 Pointer*.bin
 Pointer_Export.txt
 Pointer_Merged.tmp

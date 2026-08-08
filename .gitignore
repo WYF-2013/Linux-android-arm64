@@ -70,6 +70,3 @@ android/*.so
 
 # Generated driver installer (packer.sh embeds base64 .ko into this script)
 install_driver.sh
-
-# Downloaded cloudflared payload embedded into LS_KTool at build time
-android/jni/assets/cloudflared-linux-arm64
