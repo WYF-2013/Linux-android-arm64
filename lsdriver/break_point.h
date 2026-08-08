@@ -12,7 +12,6 @@
 #include <linux/uaccess.h>
 #include <asm/ptrace.h>
 
-#include <linux/kallsyms.h>
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/slab.h>

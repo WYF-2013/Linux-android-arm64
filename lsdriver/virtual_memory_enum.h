@@ -12,7 +12,6 @@
 #include <linux/vmalloc.h>
 #include <linux/list.h>
 #include <linux/kobject.h>
-#include <linux/kallsyms.h>
 
 #include <linux/vmalloc.h>
 #include <linux/mm.h>

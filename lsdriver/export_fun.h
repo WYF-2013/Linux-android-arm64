@@ -11,8 +11,12 @@
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/vmalloc.h>
+#include <linux/device.h>
+#include <linux/percpu.h>
+#include <linux/perf_event.h>
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
+#include <asm/patching.h>
 #include <asm/pgalloc.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable-prot.h>
@@ -22,87 +26,65 @@
 #include "lsdriver_log.h"
 
 /*
-还有注意所有地方使用函数指针调用内核api，参数类型和返回值类型一定要与内核对齐，比如这里的 unsigned long就不能写为uint64_t, uint64_t定义为unsigned long long,虽然宽度一样，但是不能混合使用
+本模块编译为独立 .ko 可加载模块。modpost 只允许 .ko 引用 EXPORT_SYMBOL 导出的符号，
+内核内部未导出符号（如 aarch64_insn_patch_text/__switch_to/do_exit 等）无法编译期链接，
+因此统一通过 kprobe 获取 kallsyms_lookup_name 地址后运行时查找。
+已导出符号（release_pages/input_class/sysfs_create_group）可直接链接，无需查找。
+
+注意所有地方通过函数指针调用内核 api，参数类型和返回值类型一定要与内核对齐，比如这里的 unsigned long
+就不能写为 uint64_t, uint64_t 定义为 unsigned long long,虽然宽度一样，但是不能混合使用
 */
 
-// 屏蔽 CFI 检查，统一利用 kprobe 获取 kallsyms_lookup_name 地址
+// 利用 kprobe 获取 kallsyms_lookup_name 地址，运行时查找内核未导出符号。
 __attribute__((no_sanitize("cfi"))) static unsigned long generic_kallsyms_lookup_name(const char *name)
 {
     unsigned long (*fn_kallsyms_lookup_name)(const char *name) = NULL;
+    static unsigned long cached_addr;
     struct kprobe kp = {0};
 
-    if (!fn_kallsyms_lookup_name)
+    if (cached_addr)
+    {
+        fn_kallsyms_lookup_name = (void *)cached_addr;
+    }
+    else
     {
         kp.symbol_name = "kallsyms_lookup_name";
         if (register_kprobe(&kp) < 0) return 0;
         fn_kallsyms_lookup_name = (void *)kp.addr;
         unregister_kprobe(&kp);
+        cached_addr = (unsigned long)fn_kallsyms_lookup_name;
     }
 
     if (!fn_kallsyms_lookup_name) return 0;
 
     return fn_kallsyms_lookup_name(name);
 }
+
+//------------------内核未导出接口（函数指针，运行时查找）-----------------
+// 同步 patch 一段内核文本指令（内部使用 stop_machine 保证多核一致性）。
+// asm/patching.h 已声明签名，但符号未导出，.ko 无法链接，改用函数指针运行时查找。
 int (*fn_aarch64_insn_patch_text)(void *addrs[], uint32_t insns[], int cnt);
 
-/*
-
-旧版 CFI ( GKI 5.10 / 5.15):
-        编译器编译时进行类型哈希计算，在间接调用前插入跳转，跳到一个集中的验证函数（就是 __cfi_slowpath）来运行时比对，
-        校验失败直接panic
-        你把它 patch 成 RET，相当于让验证永远通过
-新版 KCFI (Kernel 6.1+):
-        内核去掉了集中验证函数。编译器会在每一个间接跳转（BLR）指令的前面，内联插入几条汇编指令，
-        直接比较 hash 值。如果不对，直接触发 BRK 指令宕机。
-如果是 6.1+ 内核，不存在 __cfi_slowpath，
-
-所以有人提供了一个5系的解决代码给我，所以5系就不用下面纯汇编进行间接调用了
-感谢https://github.com/wangchuan2009(忘川)，bypass_cfi处理运行时5系的集中校验函数,patch为ret来过5系cfi
-
-2026/7/25 22:23 !!!!!!
-后续我实机测试发现部分内核有间接调用__cfi_slowpath或__cfi_slowpath_diag或_cfi_slowpath,
-直接patch为ret后cfi倒是过了，但是部分内核部分函数间接调用cfi检查函数下 BTI直接导致内核panic
-*/
-
-__attribute__((no_sanitize("cfi"))) bool bypass_cfi(void)
+// 同步 patch 内核文本指令的懒初始化：首次调用时通过 kallsyms 查找填充函数指针。
+static inline int call_aarch64_insn_patch_text(void *addrs[], uint32_t insns[], int cnt)
 {
-    // 内部状态，记录是否已经热更新成功
-    static bool is_cfi_bypassed = false;
-
-    if (is_cfi_bypassed) return true;
-
-    // 获取同步 patch 函数：内部使用 stop_machine，避免其他 CPU 执行到半补丁状态。
-    /*
-        注意：aarch64_insn_patch_text_nosync不同步多cpu
-        在patch目标地址多行指令时很可能导致其他cpu执行到半补丁状态，
-        为了防止这个情况使用aarch64_insn_patch_text，
-        如继续使用nosync，需要在patch时用stop_machine 来停止所有cpu,再热循环补丁，
-        不过aarch64_insn_patch_text就是用的我说的这个方式，
-        aarch64_insn_patch_text内部也是stop_machine 停止其他cpu，
-        在循环调用aarch64_insn_patch_text_nosync来patch指令
-        */
-    fn_aarch64_insn_patch_text = (void *)generic_kallsyms_lookup_name("aarch64_insn_patch_text");
-
-    if (!fn_aarch64_insn_patch_text) return false;
-
-    //  依次查找各个版本的 CFI slowpath 函数
-    uint64_t cfi_addr = generic_kallsyms_lookup_name("__cfi_slowpath");            // 5.10
-    if (!cfi_addr) cfi_addr = generic_kallsyms_lookup_name("__cfi_slowpath_diag"); // 5.15
-    if (!cfi_addr) cfi_addr = generic_kallsyms_lookup_name("_cfi_slowpath");       // 5.4
-
-    if (!cfi_addr) return false;
-
-    // 2026/7/25 22:23实机测试 修复，保留入口第 1 条 BTI 指令，固定将第 2 条指令 Patch 成 RET。
-    void *patch_addrs[1] = {(void *)(cfi_addr + 4)};
-    uint32_t patch_insns[1];
-    if (arm64_encode_ret(30, patch_insns)) return false;
-    if (fn_aarch64_insn_patch_text(patch_addrs, patch_insns, 1) != 0) return false;
-
-    is_cfi_bypassed = true;
-    return true;
+    if (!fn_aarch64_insn_patch_text)
+        fn_aarch64_insn_patch_text = (void *)generic_kallsyms_lookup_name("aarch64_insn_patch_text");
+    if (!fn_aarch64_insn_patch_text) return -ENOENT;
+    return fn_aarch64_insn_patch_text(addrs, insns, cnt);
 }
 
-//------------------下面是通用，但未导出，未定义函数-----------------
+//------------------内核已导出接口（可直接链接）-----------------
+// 释放一批通过 GUP 获取的 page *（mm/swap.c 已 EXPORT_SYMBOL）。
+extern void release_pages(struct page **pages, int nr);
+
+// perf 硬件断点/观察点命中后的派发回调（linux/perf_event.h 已 extern 声明，未导出，
+// 当前代码中实际调用均在注释里，不产生 modpost 引用）。
+
+// input 子系统 class（drivers/input/input.c 中 EXPORT_SYMBOL_GPL(input_class)，linux/input.h 声明为 struct class）。
+// 直接复用 linux/input.h 中的 extern struct class input_class; 调用方用 &input_class 取地址。
+
+//------------------下面是通用工具函数-----------------
 
 // 刷新同一缓存一致性域（Inner Shareable 域）内全部 CPU 中，与指定 VA 对应的所有 ASID TLB 项。
 // Android SMP SoC 中屏障范围必须与 TLBI 广播范围匹配：VAALE1IS 广播到 Inner Shareable 域，因此前后必须使用 ISHST/ISH，不能使用仅覆盖本地范围的 NSHST/NSH。
@@ -485,20 +467,9 @@ br   x16
 // 释放一批通过GUP获取的page *;避免使用 put_page() 把 page_pinner 拉进来。
 static void release_gup_pages(struct page **pages, int nr)
 {
-    typedef void (*release_pages_t)(struct page **pages, int nr);
-    static release_pages_t fn_release_pages;
-
     if (!pages || nr <= 0) return;
 
-    if (!fn_release_pages) fn_release_pages = (release_pages_t)generic_kallsyms_lookup_name("release_pages");
-
-    if (!fn_release_pages)
-    {
-        ls_log_tag("export", "严重错误！无法找到 release_pages，跳过 %d 个页引用回收\n", nr);
-        return;
-    }
-
-    fn_release_pages(pages, nr);
+    release_pages(pages, nr);
 }
 
 // 分配页对齐的内核 RWX 内存；fixed_address 为 NULL 时随机分配，否则必须传入希望占用的页对齐虚拟地址。
@@ -522,6 +493,7 @@ static void *execmem_alloc(void *fixed_address, size_t size)
         if (!IS_ALIGNED(fixed_start, PAGE_SIZE)) return NULL;
         if (alloc_size > ULONG_MAX - fixed_start) return NULL;
 
+        // __vmalloc_node_range 未导出，.ko 无法链接；6.12+ 带 _noprof 后缀，依次尝试两个符号名。
         if (!fn_vmalloc_node_range) fn_vmalloc_node_range = (void *)generic_kallsyms_lookup_name("__vmalloc_node_range");
         if (!fn_vmalloc_node_range) fn_vmalloc_node_range = (void *)generic_kallsyms_lookup_name("__vmalloc_node_range_noprof");
         if (!fn_vmalloc_node_range) return NULL;
@@ -573,100 +545,3 @@ static void execmem_free(void *ptr)
 }
 
 #endif /* _EXPORT_FUN_H_ */
-
-/*
- 6系内核就不用这个宏了，可以直接拿着函数指针调用
-
- * ARM64 内联汇编调用宏 (绕过 CFI / KCFI)
- *
- * 通过纯汇编指令 (blr) 直接跳转执行目标地址，从而绕过编译器的插入cfi
- *
- * 核心寄存器保护列表
- * 遵循 AAPCS64 (ARM64 过程调用约定) 声明 Caller-saved (调用者保存 / 易失) 寄存器。
- *
- *  [1] 通用寄存器
- *      - x9 ~ x15  : 临时调用者保存寄存器。
- *      - x16 ~ x17 : 过程内调用寄存器 (IP0, IP1 / PLT 专用)。
- *       (x0~x7和x18~x30是非易失性寄存器，属于 Callee-saved，被调用函数会负责恢复，因此无需在此声明)
- *  [2] 浮点/向量寄存器
- *      - v0 ~ v7   : 浮点参数与返回值寄存器 (调用后可能被修改)。
- *      - v16 ~ v31 : 临时调用者保存寄存器。
- *      (v8~v15 是非易失性寄存器，属于 Callee-saved，被调用函数会负责恢复，因此无需在此声明。如果确认运行环境为纯整数运算不涉及浮点，可删除 v 系列以微调性能)
- *
- *  [3] 特殊标志与屏障
- *      - lr (x30)  : 链接寄存器 (blr 指令执行时必定会覆盖它)。
- *      - cc        : 状态标志寄存器 (如 NZCV，被调用函数可能会修改条件标志)。
- *      - memory    : 编译器内存屏障，强制将寄存器缓存写回内存，并防止指令重排。
- */
-#define _KCALL_CLOBBERS "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "lr", "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
-
-// 调用 0 个参数的函数
-#define KCALL_0(fn_addr, ret_type)                                                                                                   \
-    ({                                                                                                                               \
-        register uint64_t _x0 asm("x0");                                                                                             \
-        asm volatile("blr %1\n" : "=r"(_x0) : "r"((uint64_t)(fn_addr)) : "x1", "x2", "x3", "x4", "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                              \
-    })
-
-// 调用 1 个参数的函数
-#define KCALL_1(fn_addr, ret_type, a1)                                                                                               \
-    ({                                                                                                                               \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                            \
-        asm volatile("blr %1\n" : "+r"(_x0) : "r"((uint64_t)(fn_addr)) : "x1", "x2", "x3", "x4", "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                              \
-    })
-
-// 调用 2 个参数的函数
-#define KCALL_2(fn_addr, ret_type, a1, a2)                                                                                                \
-    ({                                                                                                                                    \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                                 \
-        register uint64_t _x1 asm("x1") = (uint64_t)(a2);                                                                                 \
-        asm volatile("blr %2\n" : "+r"(_x0), "+r"(_x1) : "r"((uint64_t)(fn_addr)) : "x2", "x3", "x4", "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                                   \
-    })
-
-// 调用 3 个参数的函数
-#define KCALL_3(fn_addr, ret_type, a1, a2, a3)                                                                                                 \
-    ({                                                                                                                                         \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                                      \
-        register uint64_t _x1 asm("x1") = (uint64_t)(a2);                                                                                      \
-        register uint64_t _x2 asm("x2") = (uint64_t)(a3);                                                                                      \
-        asm volatile("blr %3\n" : "+r"(_x0), "+r"(_x1), "+r"(_x2) : "r"((uint64_t)(fn_addr)) : "x3", "x4", "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                                        \
-    })
-
-// 调用 4 个参数的函数
-#define KCALL_4(fn_addr, ret_type, a1, a2, a3, a4)                                                                                                  \
-    ({                                                                                                                                              \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                                           \
-        register uint64_t _x1 asm("x1") = (uint64_t)(a2);                                                                                           \
-        register uint64_t _x2 asm("x2") = (uint64_t)(a3);                                                                                           \
-        register uint64_t _x3 asm("x3") = (uint64_t)(a4);                                                                                           \
-        asm volatile("blr %4\n" : "+r"(_x0), "+r"(_x1), "+r"(_x2), "+r"(_x3) : "r"((uint64_t)(fn_addr)) : "x4", "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                                             \
-    })
-
-// 调用 5 个参数的函数
-#define KCALL_5(fn_addr, ret_type, a1, a2, a3, a4, a5)                                                                                                   \
-    ({                                                                                                                                                   \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                                                \
-        register uint64_t _x1 asm("x1") = (uint64_t)(a2);                                                                                                \
-        register uint64_t _x2 asm("x2") = (uint64_t)(a3);                                                                                                \
-        register uint64_t _x3 asm("x3") = (uint64_t)(a4);                                                                                                \
-        register uint64_t _x4 asm("x4") = (uint64_t)(a5);                                                                                                \
-        asm volatile("blr %5\n" : "+r"(_x0), "+r"(_x1), "+r"(_x2), "+r"(_x3), "+r"(_x4) : "r"((uint64_t)(fn_addr)) : "x5", "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                                                  \
-    })
-
-// 调用 6 个参数的函数
-#define KCALL_6(fn_addr, ret_type, a1, a2, a3, a4, a5, a6)                                                                                                    \
-    ({                                                                                                                                                        \
-        register uint64_t _x0 asm("x0") = (uint64_t)(a1);                                                                                                     \
-        register uint64_t _x1 asm("x1") = (uint64_t)(a2);                                                                                                     \
-        register uint64_t _x2 asm("x2") = (uint64_t)(a3);                                                                                                     \
-        register uint64_t _x3 asm("x3") = (uint64_t)(a4);                                                                                                     \
-        register uint64_t _x4 asm("x4") = (uint64_t)(a5);                                                                                                     \
-        register uint64_t _x5 asm("x5") = (uint64_t)(a6);                                                                                                     \
-        asm volatile("blr %6\n" : "+r"(_x0), "+r"(_x1), "+r"(_x2), "+r"(_x3), "+r"(_x4), "+r"(_x5) : "r"((uint64_t)(fn_addr)) : "x6", "x7", _KCALL_CLOBBERS); \
-        (ret_type) _x0;                                                                                                                                       \
-    })

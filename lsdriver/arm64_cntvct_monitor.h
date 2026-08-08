@@ -46,6 +46,13 @@ static void cntvct_monitor_log_user_callchain(const struct pt_regs *regs)
     unsigned long task_size = READ_ONCE(current->mm->task_size);
     if (!task_size) return;
 
+    // copy_from_user_nofault 在 GKI 内核中未 EXPORT_SYMBOL, 通过 kallsyms 查找函数指针调用
+    typedef long (*copy_from_user_nofault_t)(void *dst, const void __user *src, size_t size);
+    static copy_from_user_nofault_t fn_copy_from_user_nofault;
+    if (!fn_copy_from_user_nofault)
+        fn_copy_from_user_nofault = (copy_from_user_nofault_t)generic_kallsyms_lookup_name("copy_from_user_nofault");
+    if (!fn_copy_from_user_nofault) return;
+
     char text[384];
     size_t pos = 0;
     unsigned long address_mask = task_size - 1;
@@ -59,7 +66,7 @@ static void cntvct_monitor_log_user_callchain(const struct pt_regs *regs)
         struct cntvct_monitor_user_frame frame;
 
         if (!frame_pointer || (frame_pointer & 0xf) || frame_pointer >= task_size || task_size - frame_pointer < sizeof(frame)) break;
-        if (copy_from_user_nofault(&frame, (const void __user *)(uintptr_t)frame_pointer, sizeof(frame))) break;
+        if (fn_copy_from_user_nofault(&frame, (const void __user *)(uintptr_t)frame_pointer, sizeof(frame))) break;
 
         unsigned long return_address = frame.lr & address_mask;
         pos += scnprintf(text + pos, sizeof(text) - pos, " #%u=0x%lx", depth, return_address);

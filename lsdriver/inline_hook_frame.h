@@ -99,12 +99,11 @@ static void slot_free(int index)
 // patch预留代码段
 static int trampoline_patch(uint32_t *dst, const uint32_t *src)
 {
-    if (!fn_aarch64_insn_patch_text) return -ENOENT;
-
     void *addrs[TRAMP_WORDS];
     for (int i = 0; i < TRAMP_WORDS; i++) addrs[i] = (void *)&dst[i];
 
-    return fn_aarch64_insn_patch_text(addrs, (uint32_t *)src, TRAMP_WORDS);
+    // aarch64_insn_patch_text 未导出，通过 call_aarch64_insn_patch_text 懒初始化查找后调用。
+    return call_aarch64_insn_patch_text(addrs, (uint32_t *)src, TRAMP_WORDS);
 }
 // 保存目标入口即将被覆盖的原始AArch64指令word。
 static void hook_save_orig_insns(uint64_t addr, uint32_t *insns, int count)
@@ -165,14 +164,13 @@ static int hook_relocate_replay_insns(uint64_t source_addr, uint64_t replay_addr
 // 批量 patch 一段 AArch64 指令；aarch64_insn_patch_text 内部负责 stop_machine 同步。
 static int hook_patch_words(uint64_t addr, const uint32_t *insns, int count)
 {
-    if (!fn_aarch64_insn_patch_text) return -ENOENT;
-
     if (count <= 0 || count > HOOK_STUB_WORDS) return -EINVAL;
 
     void *addrs[HOOK_STUB_WORDS];
     for (int i = 0; i < count; i++) addrs[i] = (void *)(uintptr_t)(addr + i * 4);
 
-    return fn_aarch64_insn_patch_text(addrs, (uint32_t *)insns, count);
+    // aarch64_insn_patch_text 未导出，通过 call_aarch64_insn_patch_text 懒初始化查找后调用。
+    return call_aarch64_insn_patch_text(addrs, (uint32_t *)insns, count);
 }
 
 static inline void *hook_frame_metadata(struct pt_regs *regs)
@@ -364,7 +362,7 @@ static int hook_entry_install(struct hook_entry *e)
 
     if (e->installed) return 0;
 
-    // 查符号地址
+    // 目标函数多为内核未导出符号，.ko 无法编译期链接，运行时通过 kallsyms 查找入口地址。
     if (!e->target_addr && e->target_sym)
     {
         e->target_addr = generic_kallsyms_lookup_name(e->target_sym);
@@ -486,6 +484,7 @@ void inline_hook_remove_all(void)
 }
 
 // 便捷宏:申明一个hook_entry
+// sym 为目标函数符号名字符串；target_addr 运行时由 kallsyms 查找填充。
 #define HOOK_ENTRY(sym, fn)  \
     {                        \
         .target_sym = (sym), \

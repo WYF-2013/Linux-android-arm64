@@ -7,6 +7,7 @@
 #include <linux/slab.h>
 #include <linux/version.h>
 #include <linux/compiler.h>
+#include "export_fun.h"
 #include "lsdriver_log.h"
 
 /*
@@ -259,13 +260,14 @@ static inline int v_touch_init(int request_virtual_slots, int *max_x, int *max_y
     int ret = init_virtual_input_params(request_virtual_slots);
     if (ret) return ret;
 
+    // input_class 在 GKI 内核中未 EXPORT_SYMBOL, 通过 kallsyms 查找
     struct class *input_class = (struct class *)generic_kallsyms_lookup_name("input_class");
     if (!input_class)
     {
         ls_log_tag("vtouch", "input_class 查找失败\n");
-        return -EFAULT;
-    }
 
+        return -ENODEV;
+    }
     struct input_dev *found = NULL;
     class_for_each_device(input_class, NULL, &found, match_touchscreen);
     if (!found)

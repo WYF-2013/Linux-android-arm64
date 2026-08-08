@@ -12,7 +12,6 @@
 #include <linux/vmalloc.h>
 #include <linux/list.h>
 #include <linux/kobject.h>
-#include <linux/kallsyms.h>
 
 #include "io_struct.h"
 #include "export_fun.h"
@@ -490,14 +489,13 @@ static void hide_myself(void)
 {
     // 内核模块结构体
     struct module_use *use, *tmp;
-    // 小于内核 6.12才能隐藏vmap_area_list和_vmap_area_root，高版本移除了这个数据结构，由https://github.com/wenyounb，发现
+    // 小于内核 6.12才能隐藏vmap_area_list，高版本移除了这个数据结构，由https://github.com/wenyounb，发现
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
     struct vmap_area *va, *vtmp;
     struct list_head *_vmap_area_list;
-    struct rb_root *_vmap_area_root;
-
+    // vmap_area_list / vmap_area_root 均未导出（vmap_area_root 还是 static），.ko 无法链接，运行时查找。
+    // vmap_area_root 为 static 无法查到有效地址，这里只摘除链表，不再从红黑树摘除。
     _vmap_area_list = (struct list_head *)generic_kallsyms_lookup_name("vmap_area_list");
-    _vmap_area_root = (struct rb_root *)generic_kallsyms_lookup_name("vmap_area_root");
 
     // 摘除vmalloc调用关系链，/proc/vmallocinfo中不可见
     list_for_each_entry_safe(va, vtmp, _vmap_area_list, list)
@@ -505,8 +503,6 @@ static void hide_myself(void)
         if ((uint64_t)THIS_MODULE > va->va_start && (uint64_t)THIS_MODULE < va->va_end)
         {
             list_del(&va->list);
-            // rbtree中摘除，无法通过rbtree找到
-            rb_erase(&va->rb_node, _vmap_area_root);
         }
     }
 
@@ -531,8 +527,6 @@ static int __init lsdriver_init(void)
     //*(volatile int *)0 = 0;
 
     // print_el2_status(); // 输出Hypervisor相关信息
-
-    // bypass_cfi(); // 先尝试绕过 5系的cfi
 
     // hide_myself(); // 隐藏内核模块本身
 

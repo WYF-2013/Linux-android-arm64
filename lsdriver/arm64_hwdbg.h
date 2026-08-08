@@ -1,7 +1,6 @@
 ﻿#include <linux/module.h>
 #include <linux/bitops.h>
 #include <linux/kernel.h>
-#include <linux/kallsyms.h>
 #include <linux/memory.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
@@ -30,9 +29,7 @@
 */
 struct break_point *g_bp_info;
 int num_brps, num_wrps; // 硬件执行和访问槽位总数
-static struct perf_event * __percpu * bp_on_reg;
-static struct perf_event * __percpu * wp_on_reg;
-static void (*fn_perf_bp_event)(struct perf_event *event, void *data);
+// perf_bp_event 由 linux/perf_event.h extern 声明；bp_on_reg/wp_on_reg 在内核中是 static，当前代码未实际使用。
 
 // 判断单个断点点位是否具备安装和派发条件。
 static bool hwbp_point_is_active(struct bp_point *point)
@@ -334,7 +331,7 @@ static int work_trampoline_breakpoint(struct pt_regs *hook_regs)
                 // {
                 //     bp = READ_ONCE(slots[slot]);
                 //     if (bp)
-                //         fn_perf_bp_event(bp, regs);
+                //         perf_bp_event(bp, regs);
                 // }
                 // hook_regs->regs[0] = 0;// 给 breakpoint_handler返回 0，表示已处理异常
                 // return 1;     // 给hook框架返回1，表示跳过原函数
@@ -411,7 +408,7 @@ static int work_trampoline_watchpoint(struct pt_regs *hook_regs)
     // {
     //     bp = READ_ONCE(slots[hit_slot]);
     //     if (bp)
-    //         fn_perf_bp_event(bp, regs);
+    //         perf_bp_event(bp, regs);
     // }
     // hook_regs->regs[0] = 0;
     // return 1;
@@ -675,15 +672,7 @@ static int start_task_run_monitor(struct break_point *bp_info)
     // 总数也是只获取一次。
     num_brps = get_brps_num();
     num_wrps = get_wrps_num();
-    bp_on_reg = (struct perf_event * __percpu *)generic_kallsyms_lookup_name("bp_on_reg");
-    wp_on_reg = (struct perf_event * __percpu *)generic_kallsyms_lookup_name("wp_on_reg");
-    fn_perf_bp_event = (void (*)(struct perf_event *, void *))generic_kallsyms_lookup_name("perf_bp_event");
-    if (!bp_on_reg || !wp_on_reg || !fn_perf_bp_event)
-    {
-        ls_log_tag("hwbp", "lookup bp_on_reg/wp_on_reg/perf_bp_event failed\n");
-        g_bp_info = NULL;
-        return -ENOENT;
-    }
+    // perf_bp_event 由内核头声明，编译期链接解析，恒有效，无需判空。
     bp_info->num_brps = num_brps;
     bp_info->num_wrps = num_wrps;
 
