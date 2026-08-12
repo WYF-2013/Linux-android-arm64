@@ -1419,7 +1419,7 @@ private:
         UI::Space(S(12));
         ImGui::Separator();
         UI::Space(S(8));
-        UI::Text({0.6f, 0.7f, 0.8f, 1}, "文件操作 (Pointer.bin)");
+        UI::Text({0.6f, 0.7f, 0.8f, 1}, "文件操作 (/sdcard/lsdriver/)");
         UI::Space(S(4));
         UI::ButtonRow(w, S(40), {{"开始对比", Colors::BTN_PURPLE, [&] { ptrManager_.MergeBins(); }}, {"格式化输出", {0.45f, 0.35f, 0.2f, 1}, [&] { ptrManager_.ExportToTxt(); }}}, S(8));
         ImGui::EndDisabled();
@@ -1438,7 +1438,7 @@ private:
         {
             UI::Text(Colors::OK, "操作完成，指针链数量: %zu", pointerState.count);
         }
-        else UI::Text(Colors::HINT, "扫描结果保存到 Pointer.bin");
+        else UI::Text(Colors::HINT, "扫描结果保存到 /sdcard/lsdriver/Pointer.bin");
         ImGui::PopID();
     }
 
@@ -1474,7 +1474,7 @@ private:
         {
             if (auto addr = ParseHexAddress(buf_.sigScanAddr)) SignatureScanner::ScanAddressSignature(*addr, sigParams_.range);
         }
-        UI::Text(Colors::HINT, "保存到 Signature.txt");
+        UI::Text(Colors::HINT, "保存到 /sdcard/lsdriver/Signature.txt");
 
         // 过滤部分
         UI::Space(S(20));
@@ -1500,7 +1500,7 @@ private:
         {
             sigParams_.lastChanged == 0 ? UI::Text(Colors::OK, "完美! 无变动 (%d字节)", sigParams_.lastTotal) : UI::Text(Colors::WARN, "变动: %d/%d (已更新)", sigParams_.lastChanged, sigParams_.lastTotal);
         }
-        else if (sigParams_.lastChanged == -2) UI::Text(Colors::ERR, "失败! 检查Signature.txt");
+        else if (sigParams_.lastChanged == -2) UI::Text(Colors::ERR, "失败! 检查 /sdcard/lsdriver/Signature.txt");
 
         UI::Space(S(10));
         if (UI::Btn("扫描特征码", {w, S(48)}, Colors::BTN_PURPLE)) sigParams_.lastScanCount = (int)SignatureScanner::ScanSignatureFromFile().size();
@@ -1508,7 +1508,7 @@ private:
         {
             sigParams_.lastScanCount == 0 ? UI::Text(Colors::ERR, "未找到匹配地址") : UI::Text({0.5f, 0.9f, 1, 1}, "找到 %d 个地址", sigParams_.lastScanCount);
         }
-        UI::Text(Colors::HINT, "结果保存到 Signature.txt");
+        UI::Text(Colors::HINT, "结果保存到 /sdcard/lsdriver/Signature.txt");
     }
 
     // ================================================================
@@ -2343,32 +2343,46 @@ static bool daemonize(const char *log_path)
     return true;
 }
 
-int main()
+int main(int argc, char *argv[])
 {
-    std::println(stdout, "请选择启动模式：");
-    std::println(stdout, "  0) 停止驱动线程");
-    std::println(stdout, "  1) 读写测试");
-    std::println(stdout, "  2) 触摸测试");
-    std::println(stdout, "  3) 内存工具");
-    std::println(stdout, "  4) HTTP服务器");
-    std::println(stdout, "  5) 陀螺仪测试");
-    std::println(stdout, "  6) 定位测试");
-    std::print(stdout, "请输入 [0/1/2/3/4/5/6]: ");
-    std::fflush(stdout);
-
     int rc = 1;
     int mode = 0;
-    bool c = (bool)(std::cin >> mode);
 
-    if (!c)
+    if (argc > 1)
     {
-        std::println(stderr, "[错误] 输入无效。");
-        return rc;
+        // 命令行参数模式: LS_KTool <mode>
+        mode = std::atoi(argv[1]);
+        if (mode < 0 || mode > 6)
+        {
+            std::println(stderr, "[错误] 未知选项: {}", mode);
+            return rc;
+        }
     }
-    if (mode < 0 || mode > 6)
+    else
     {
-        std::println(stderr, "[错误] 未知选项: {}", mode);
-        return rc;
+        std::println(stdout, "请选择启动模式：");
+        std::println(stdout, "  0) 停止驱动线程");
+        std::println(stdout, "  1) 读写测试");
+        std::println(stdout, "  2) 触摸测试");
+        std::println(stdout, "  3) 内存工具");
+        std::println(stdout, "  4) HTTP服务器");
+        std::println(stdout, "  5) 陀螺仪测试");
+        std::println(stdout, "  6) 定位测试");
+        std::print(stdout, "请输入 [0/1/2/3/4/5/6]: ");
+        std::fflush(stdout);
+
+        bool c = (bool)(std::cin >> mode);
+
+        if (!c)
+        {
+            std::println(stderr, "[错误] 输入无效。");
+            return rc;
+        }
+        if (mode < 0 || mode > 6)
+        {
+            std::println(stderr, "[错误] 未知选项: {}", mode);
+            return rc;
+        }
     }
 
     if (!daemonize("/sdcard/log.txt"))

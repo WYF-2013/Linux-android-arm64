@@ -14,10 +14,12 @@
 .vscode/
 .claude/
 .codex/
+.zcode/
 # android build outputs
 android/obj/
 android/libomp.a
 android/libomp.so
+android/libs/
 obj/
 /libs/
 windows/__pycache__/

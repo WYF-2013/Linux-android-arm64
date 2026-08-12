@@ -95,6 +95,59 @@ namespace Config
 
 } // namespace Config
 
+// ============================================================================
+// 工作区目录 (Workspace)
+// ----------------------------------------------------------------------------
+// 所有运行期生成的文件一律收敛到 /sdcard 子目录，避免在非 sdcard 目录
+// (如 CWD 根目录、/data/akernel、/tmp 等) 留下文件。
+// ============================================================================
+namespace Workspace
+{
+    inline constexpr const char *BASE_DIR = "/sdcard/lsdriver";
+
+    // 确保工作区目录存在（幂等；失败仅记录日志，调用方按 /sdcard 根回退）。
+    inline void EnsureBaseDir() noexcept
+    {
+        static std::atomic<bool> ready{false};
+        if (ready.load(std::memory_order_acquire)) return;
+        if (mkdir(BASE_DIR, 0777) != 0 && errno != EEXIST)
+            LS_LOGE_TAG_FMT("Workspace", "无法创建工作区 {}: {}", BASE_DIR, std::strerror(errno));
+        ready.store(true, std::memory_order_release);
+    }
+
+    // 相对名解析到工作区内；绝对路径保持原样。
+    inline std::string Resolve(std::string_view name)
+    {
+        if (name.empty()) return BASE_DIR;
+        if (name.front() == '/') return std::string(name);
+        return std::string(BASE_DIR) + "/" + std::string(name);
+    }
+
+    // 判断路径是否位于 /sdcard 之下。
+    inline bool IsUnderSdcard(std::string_view path) noexcept
+    {
+        return path.starts_with("/sdcard/");
+    }
+
+    // tmpfile() 的 /sdcard 版本：在工作区内创建一个立即解除链接的临时文件，
+    // 关闭后自动回收，语义与 tmpfile() 一致，但不会落到 /tmp 或 CWD。
+    inline FILE *MakeTempFile() noexcept
+    {
+        EnsureBaseDir();
+        char tmpl[128];
+        std::snprintf(tmpl, sizeof(tmpl), "%s/.lstmp_XXXXXX", BASE_DIR);
+        int fd = mkstemp(tmpl);
+        if (fd < 0)
+        {
+            std::snprintf(tmpl, sizeof(tmpl), "/sdcard/.lstmp_XXXXXX"); // 工作区不可用时回退到 /sdcard 根
+            fd = mkstemp(tmpl);
+            if (fd < 0) return nullptr;
+        }
+        unlink(tmpl);
+        return fdopen(fd, "w+b");
+    }
+} // namespace Workspace
+
 namespace SyscallLog
 {
     inline std::string ReadDmesg(std::string_view tag = {})
@@ -777,7 +830,7 @@ namespace SignatureScanner
         std::string ResolveSigPath(std::string_view path)
         {
             if (IsAbsoluteSigPath(path)) return std::string(path);
-            return std::string("/data/akernel/") + std::string(path);
+            return Workspace::Resolve(path);
         }
 
         std::string FormatSignature(const SigElement &sig)
@@ -912,26 +965,17 @@ namespace SignatureScanner
 
         bool ReadSigFileWithFallback(const char *filename, int &range, std::string &sigText)
         {
-            const std::string rawName = NormalizeSigFileName(filename);
-            if (ReadSigFile(rawName.c_str(), range, sigText)) return true;
-            if (!IsAbsoluteSigPath(rawName))
-            {
-                const std::string fallback = ResolveSigPath(rawName);
-                return ReadSigFile(fallback.c_str(), range, sigText);
-            }
-            return false;
+            // 相对名直接解析到 /sdcard 工作区；绝对名按原路径读取（读取不生成文件，保持兼容）。
+            const std::string resolved = ResolveSigPath(NormalizeSigFileName(filename));
+            return ReadSigFile(resolved.c_str(), range, sigText);
         }
 
         bool WriteSigFileWithFallback(const char *filename, uintptr_t addr, int range, const SigElement &sig)
         {
-            const std::string rawName = NormalizeSigFileName(filename);
-            if (WriteSigFile(rawName.c_str(), addr, range, sig)) return true;
-            if (!IsAbsoluteSigPath(rawName))
-            {
-                const std::string fallback = ResolveSigPath(rawName);
-                return WriteSigFile(fallback.c_str(), addr, range, sig);
-            }
-            return false;
+            // 写入强制收敛到 /sdcard：绝对路径若不在 /sdcard 下，改写到工作区内同名文件。
+            std::string resolved = ResolveSigPath(NormalizeSigFileName(filename));
+            if (!Workspace::IsUnderSdcard(resolved)) resolved = Workspace::Resolve(MemUtils::BaseName(resolved));
+            return WriteSigFile(resolved.c_str(), addr, range, sig);
         }
     } // namespace
 
@@ -1073,7 +1117,8 @@ namespace SignatureScanner
         LS_LOGI_TAG_FMT("Signature", "文件扫描完成: 找到 {} 个匹配", matches.size());
 
         const std::string outPath = ResolveSigPath(NormalizeSigFileName(filename));
-        std::ofstream out(outPath, std::ios::app);
+        const std::string safeOut = Workspace::IsUnderSdcard(outPath) ? outPath : Workspace::Resolve(MemUtils::BaseName(outPath));
+        std::ofstream out(safeOut, std::ios::app);
         if (out)
         {
             std::println(out, "\n扫描结果: {} 个", matches.size());
@@ -1146,7 +1191,7 @@ private:
 
     static FilePtr createCandidateFile()
     {
-        FilePtr file(tmpfile());
+        FilePtr file(Workspace::MakeTempFile());
         if (!file) throw std::runtime_error("无法创建扫描候选临时文件");
         return file;
     }
@@ -2696,7 +2741,25 @@ private:
     static bool SaveUniqueBin(FILE *source, std::string &path)
     {
         if (!source) return false;
-        char tempPath[] = ".Pointer_scan_XXXXXX";
+        Workspace::EnsureBaseDir();
+
+        // 先在工作区内挑选一个不存在的目标名（Pointer.bin / Pointer_N.bin）。
+        std::string candidate;
+        bool found = false;
+        for (int i = 0; i < 9999; ++i)
+        {
+            char nameBuf[32];
+            if (i == 0) std::snprintf(nameBuf, sizeof(nameBuf), "Pointer.bin");
+            else std::snprintf(nameBuf, sizeof(nameBuf), "Pointer_%d.bin", i);
+            candidate = Workspace::Resolve(nameBuf);
+            if (access(candidate.c_str(), F_OK) != 0) { found = true; break; } // 不存在即可用
+        }
+        if (!found) return false;
+
+        // 写入工作区内的临时文件，完整落盘后再原子发布（rename 在 /sdcard 上可用，
+        // 而硬链接 link() 在 FUSE/FAT 文件系统上通常不支持，故不再使用）。
+        char tempPath[128];
+        std::snprintf(tempPath, sizeof(tempPath), "%s/.Pointer_scan_XXXXXX", Workspace::BASE_DIR);
         int fd = mkstemp(tempPath);
         if (fd < 0) return false;
 
@@ -2723,20 +2786,11 @@ private:
         FILE *raw = temp.release();
         if (fclose(raw) != 0) ok = false;
 
-        char candidate[256];
         bool published = false;
-        for (int i = 0; ok && i < 9999; ++i)
+        if (ok && rename(tempPath, candidate.c_str()) == 0)
         {
-            if (i == 0) snprintf(candidate, sizeof(candidate), "Pointer.bin");
-            else snprintf(candidate, sizeof(candidate), "Pointer_%d.bin", i);
-
-            if (link(tempPath, candidate) == 0)
-            {
-                path = candidate;
-                published = true;
-                break;
-            }
-            if (errno != EEXIST) break;
+            path = candidate;
+            published = true;
         }
         remove(tempPath);
         return published;
@@ -3199,7 +3253,7 @@ public:
         if (regions_.empty() || buf_count <= 0 || buf_size < static_cast<int>(sizeof(uintptr_t))) return false;
         const size_t blockSize = static_cast<size_t>(buf_size) / sizeof(uintptr_t) * sizeof(uintptr_t);
 
-        FilePtr merged(tmpfile());
+        FilePtr merged(Workspace::MakeTempFile());
         if (!merged)
         {
             LS_LOGE_TAG("Pointer", "无法创建合并临时文件");
@@ -3368,7 +3422,7 @@ private:
             }
             LS_LOGI_TAG_FMT("Pointer", "内存快照数量: {}", pointerCount);
 
-            FilePtr outfile(tmpfile());
+            FilePtr outfile(Workspace::MakeTempFile());
             if (!outfile)
             {
                 LS_LOGE_TAG("Pointer", "无法创建结果临时文件");
@@ -3998,12 +4052,16 @@ public:
                                      LS_LOGI_TAG("Pointer", "开始基于图裁剪算法合并结果");
 
                                      std::vector<std::string> files;
-                                     if (access("Pointer.bin", F_OK) == 0) files.push_back("Pointer.bin");
+                                     {
+                                         std::string p = Workspace::Resolve("Pointer.bin");
+                                         if (access(p.c_str(), F_OK) == 0) files.push_back(p);
+                                     }
                                      for (int i = 1; i < 9999; ++i)
                                      {
                                          char buf[64];
                                          snprintf(buf, 64, "Pointer_%d.bin", i);
-                                         if (access(buf, F_OK) == 0) files.push_back(buf);
+                                         std::string p = Workspace::Resolve(buf);
+                                         if (access(p.c_str(), F_OK) == 0) files.push_back(p);
                                      }
 
                                      if (files.size() < 2)
@@ -4046,21 +4104,23 @@ public:
                                      }
 
                                      const size_t mergedChainCount = CountGraphChains(GA);
-                                     remove("Pointer_Merged.tmp");
-                                     if (!GA.save("Pointer_Merged.tmp"))
+                                     const std::string mergedTmp = Workspace::Resolve("Pointer_Merged.tmp");
+                                     const std::string pointerBin = Workspace::Resolve("Pointer.bin");
+                                     remove(mergedTmp.c_str());
+                                     if (!GA.save(mergedTmp))
                                      {
                                          error = "无法完整写入合并临时文件";
                                          return;
                                      }
-                                     if (rename("Pointer_Merged.tmp", "Pointer.bin") != 0)
+                                     if (rename(mergedTmp.c_str(), pointerBin.c_str()) != 0)
                                      {
-                                         error = std::format("无法替换 Pointer.bin: {}", std::strerror(errno));
-                                         remove("Pointer_Merged.tmp");
+                                         error = std::format("无法替换 {}: {}", pointerBin, std::strerror(errno));
+                                         remove(mergedTmp.c_str());
                                          return;
                                      }
                                      for (const auto &fn : files)
                                      {
-                                         if (fn != "Pointer.bin" && remove(fn.c_str()) != 0) LS_LOGE_TAG_FMT("Pointer", "无法删除旧文件 {}: {}", fn, std::strerror(errno));
+                                         if (fn != pointerBin && remove(fn.c_str()) != 0) LS_LOGE_TAG_FMT("Pointer", "无法删除旧文件 {}: {}", fn, std::strerror(errno));
                                      }
 
                                      chainCount_ = mergedChainCount;
@@ -4101,16 +4161,17 @@ public:
                                      LS_LOGI_TAG("Pointer", "开始导出文本链条");
 
                                      MemoryGraph graph;
-                                     if (!graph.load("Pointer.bin"))
+                                     const std::string pointerBin = Workspace::Resolve("Pointer.bin");
+                                     if (!graph.load(pointerBin))
                                      {
                                          error = "无法加载或校验 Pointer.bin";
                                          return;
                                      }
 
-                                     constexpr const char *tempPath = "Pointer_Export.tmp";
-                                     constexpr const char *outputPath = "Pointer_Export.txt";
-                                     remove(tempPath);
-                                     FilePtr output(fopen(tempPath, "wb"));
+                                     const std::string tempPath = Workspace::Resolve("Pointer_Export.tmp");
+                                     const std::string outputPath = Workspace::Resolve("Pointer_Export.txt");
+                                     remove(tempPath.c_str());
+                                     FilePtr output(fopen(tempPath.c_str(), "wb"));
                                      if (!output)
                                      {
                                          error = std::format("无法创建导出临时文件: {}", std::strerror(errno));
@@ -4118,11 +4179,11 @@ public:
                                      }
                                      struct TempGuard
                                      {
-                                         const char *path;
+                                         std::string path;
                                          bool committed = false;
                                          ~TempGuard()
                                          {
-                                             if (!committed) remove(path);
+                                             if (!committed) remove(path.c_str());
                                          }
                                      } tempGuard{tempPath};
 
@@ -4222,7 +4283,7 @@ public:
                                          error = "导出文件写入不完整";
                                          return;
                                      }
-                                     if (rename(tempPath, outputPath) != 0)
+                                     if (rename(tempPath.c_str(), outputPath.c_str()) != 0)
                                      {
                                          error = std::format("无法替换 {}: {}", outputPath, std::strerror(errno));
                                          return;
