@@ -2,6 +2,8 @@
 
 > 仅供技术研究与学习，严禁用于非法用途。作者不承担任何违法责任。
 
+> 部署排坑记录见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)：Git Bash 路径篡改、守护进程被 ps 隐藏、logcat 日志位置、端口占用误判等实际部署问题的原因与解法。
+
 ## 项目简介
 
 LuckyStar 是一套 Android ARM64 内存调试工具，包含三个组件：
@@ -94,8 +96,11 @@ adb shell "lsmod | grep lsdriver"
 adb push LS_KTool /data/local/tmp/LS_KTool
 adb shell "chmod 755 /data/local/tmp/LS_KTool"
 
-# 以模式 4 (HTTP服务器) 启动
-adb shell "su -c 'echo 4 | /data/local/tmp/LS_KTool'"
+# 以模式 4 (HTTP服务器) 启动（参数方式比 stdin 管道可靠）
+adb shell "su -c '/data/local/tmp/LS_KTool 4'"
+
+# 进程启动后被驱动隐藏，ps 查不到属预期；日志在 logcat（tag: ls）。
+# 验证服务用 curl /health，详见 TROUBLESHOOTING.md
 ```
 
 服务监听 `0.0.0.0:9494`，提供以下端点：
