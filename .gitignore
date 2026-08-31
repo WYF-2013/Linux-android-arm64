@@ -35,6 +35,7 @@ windows/__pycache__/
 
 # Local ARM64 decoder and executor tests
 lsdriver/arm64_tests/*
+!lsdriver/arm64_tests/arm64_decode_test.c
 !lsdriver/arm64_tests/arm64_page_reloc_test.c
 !lsdriver/arm64_tests/arm64_encode_test.c
 !lsdriver/arm64_tests/run_tests.sh
@@ -72,3 +73,8 @@ android/*.so
 
 # Generated driver installer (packer.sh embeds base64 .ko into this script)
 install_driver.sh
+install_driver_cache.sh
+install_driver_nocache.sh
+
+# Upstream debug dump binary
+panic_reserve_dump

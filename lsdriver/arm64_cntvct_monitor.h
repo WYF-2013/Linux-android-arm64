@@ -10,7 +10,6 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/smp.h>
-#include <linux/uaccess.h>
 #include <clocksource/arm_arch_timer.h>
 #include <asm/esr.h>
 #include <asm/ptrace.h>

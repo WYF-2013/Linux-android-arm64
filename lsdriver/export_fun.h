@@ -10,6 +10,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
+#include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/device.h>
 #include <linux/percpu.h>
@@ -404,66 +405,6 @@ static inline int write_user_pte_value(struct mm_struct *mm, uint64_t addr, ptev
     return 0;
 }
 
-/*
-编码一条b指令
-
-在各个内核源码链接：
-Android 12 / 5.10
-MODULES_VSIZE = SZ_128M
-https://android.googlesource.com/kernel/common/+/refs/heads/android12-5.10/arch/arm64/include/asm/memory.h
-
-Android 13 / 5.15
-MODULES_VSIZE = SZ_128M
-https://android.googlesource.com/kernel/common/+/refs/heads/android13-5.15/arch/arm64/include/asm/memory.h
-
-Android 14 / 6.1
-MODULES_VSIZE = SZ_128M
-https://android.googlesource.com/kernel/common/+/refs/heads/android14-6.1/arch/arm64/include/asm/memory.h
-
-Android 15 / 6.6
-MODULES_VSIZE = SZ_2G
-https://android.googlesource.com/kernel/common/+/refs/heads/android15-6.6/arch/arm64/include/asm/memory.h
-
-Android 16 / 6.12
-MODULES_VSIZE = SZ_2G
-https://android.googlesource.com/kernel/common/+/refs/heads/android16-6.12/arch/arm64/include/asm/memory.h
-
-也就是说，外部内核模块加载时所在的内存区域是每个版本的内核不一样
-5系和6.1是128M不用看了符合B指令跳转范围
-
-6.6处理内核模块源码路径
-https://android.googlesource.com/kernel/common/+/refs/heads/android15-6.6/arch/arm64/kernel/module.c
-module_alloc() 优先从 128M  区分配
-if (module_direct_base) {
-    p = __vmalloc_node_range(size, MODULE_ALIGN,module_direct_base, module_direct_base + SZ_128M,...);
-}
-如果失败，再从 2G PLT 区分配：
-if (!p && module_plt_base) {
-    p = __vmalloc_node_range(size, MODULE_ALIGN, module_plt_base,module_plt_base + SZ_2G,...);
-}
-模块里调用内核 API，编译后常见就是 bl symbol，对应:
-R_AARCH64_CALL26
-R_AARCH64_JUMP26
-loader 先尝试直接把目标地址写进 26-bit branch immediate：
-
-ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 26, AARCH64_INSN_IMM_26);
-如果超出 ±128M：
-if (ovf == -ERANGE) {
-    val = module_emit_plt_entry(...);
-    ...
-    ovf = reloc_insn_imm(... loc, val, 2, 26, ...);
-}
-意思是：原本 bl 内核API 跳不到内核 API，就在模块自己的 .plt 里生成一个近处跳板，然后把 bl 改成跳这个 .plt entry。
-
-PLT entry 在 arch/arm64/kernel/module-plts.c：
-
-plt = __get_adrp_add_pair(dst, (u64)pc, AARCH64_INSN_REG_16);
-plt.br = cpu_to_le32(br);
-也就是类似：
-adrp x16, target_page
-add  x16, x16, target_pageoff
-br   x16
-*/
 // 释放一批通过GUP获取的page *;避免使用 put_page() 把 page_pinner 拉进来。
 static void release_gup_pages(struct page **pages, int nr)
 {
@@ -542,6 +483,38 @@ static void execmem_free(void *ptr)
 {
     if (!ptr) return;
     vfree(ptr);
+}
+
+/*
+copy_from_user_nofault() 虽在 common kernel 源码中写了 EXPORT_SYMBOL_GPL但 Android GKI 会按 KMI 符号列表裁剪导出。
+源码里声明导出，不代表具体设备的 __ksymtab 一定包含它
+这里用pagefault_disable+__copy_from_user_inatomic实现于copy_from_user_nofault()一样的效果
+不主动补页、不睡眠、读取失败立即返回 -EFAULT
+,
+__copy_from_user_inatomic它本身是头文件内联， 实际依赖的是根据ARM64 宏  raw_copy_from_user()进行展开为 ARM64 的 __arch_copy_from_user
+*/
+static __always_inline int copy_from_user_inatomic_nofault(void *dst, const void __user *src, size_t size)
+{
+    unsigned long not_copied;
+
+    if (!access_ok(src, size)) return -EFAULT;
+
+    pagefault_disable();
+    not_copied = __copy_from_user_inatomic(dst, src, size);
+    pagefault_enable();
+    return not_copied ? -EFAULT : 0;
+}
+
+static __always_inline int copy_to_user_inatomic_nofault(void __user *dst, const void *src, size_t size)
+{
+    unsigned long not_copied;
+
+    if (!access_ok(dst, size)) return -EFAULT;
+
+    pagefault_disable();
+    not_copied = __copy_to_user_inatomic(dst, src, size);
+    pagefault_enable();
+    return not_copied ? -EFAULT : 0;
 }
 
 #endif /* _EXPORT_FUN_H_ */

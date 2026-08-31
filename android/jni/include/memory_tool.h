@@ -2258,6 +2258,7 @@ private:
     Types::ViewFormat format_ = Types::ViewFormat::Hexadecimal;
     std::vector<uint8_t> buffer_;
     bool readSuccess_ = false;
+    int readStatus_ = 0;
     std::vector<Disasm::DisasmLine> disasmCache_;
     std::future<std::vector<Disasm::DisasmLine>> disasmFuture_;
     bool disasmBusy_ = false;
@@ -2276,6 +2277,10 @@ public:
     bool readSuccess() const noexcept
     {
         return readSuccess_;
+    }
+    int readStatus() const noexcept
+    {
+        return readStatus_;
     }
     // 返回当前浏览基址。
     uintptr_t base() const noexcept
@@ -2327,6 +2332,7 @@ public:
         waitDisasm();
         base_ = 0;
         readSuccess_ = false;
+        readStatus_ = 0;
         std::ranges::fill(buffer_, 0);
         disasmCache_.clear();
     }
@@ -2346,6 +2352,7 @@ public:
         if (base_ > Config::Constants::ADDR_MAX)
         {
             readSuccess_ = false;
+            readStatus_ = -EINVAL;
             disasmBusy_ = false;
             disasmCache_.clear();
             return;
@@ -2353,6 +2360,7 @@ public:
         std::ranges::fill(buffer_, 0);
         const int readBytes = dr->Read(base_, buffer_.data(), buffer_.size());
         readSuccess_ = readBytes > 0;
+        readStatus_ = readBytes;
         if (!readSuccess_)
         {
             disasmBusy_ = false;

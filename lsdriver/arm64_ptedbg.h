@@ -13,11 +13,42 @@
 
 #include "inline_hook_frame.h"
 #include "io_struct.h"
-#include "emulate_insn.h"
+#include "arm64_emulate/emulate_insn.h"
 #include "lsdriver_log.h"
 
-// 单次取指异常中连续模拟的最大指令数量，避免页内循环长期占用异常上下文。
-#define PTEBP_BATCH_INSN_LIMIT 4096
+/*
+单次取指异常中连续模拟的最大指令数量，避免页内循环长期占用异常上下文。
+也不建议改小，定义为0x1或其他小范围
+
+原因就是，这种类似的典型指令
+retry:
+    ldxr x14, [x9]        // 读取，并建立 CPU 本地独占监视
+    eor  x14, x14, x11
+    stxr w15, x14, [x9]   // 使用前面的独占监视尝试写入
+    cbnz w15, retry
+LDXR 本身只执行一次，STXR 也只执行一次；但二者需要尽量在同一段连续执行流中完成。
+CPU在执行 LDXR 后保存的 reservation 不在 pt_regs 里，异常进入/返回可能清除它。
+因此，
+为0x1时的整体错误处理异常流程
+    用户态准备执行 LDXR
+        | UXN取指异常
+    EL1模拟 LDXR，PC推进到 EOR
+        | ERET返回用户态
+    用户态准备取 EOR，还没执行
+        | UXN取指异常
+    EL1模拟 EOR，PC推进到 STXR
+        | ERET返回用户态
+    用户态准备取 STXR，还没执行
+        | UXN取指异常
+    EL1模拟 STXR，但独占监视已经失效，CPU在执行 LDXR 后保存的 reservation 不在 pt_regs 里，异常边界导致独占监视失效(异常进入/返回可能清除它)，会使 STXR 反复返回失败状态。
+        |
+    w15 = 1，PC推进到 CBNZ
+        | ERET返回用户态
+    用户态准备取 CBNZ
+        | UXN取指异常
+    EL1模拟 CBNZ，因为 w15 != 0(是STXR失败状态导致)，跳回 LDXR
+*/
+#define PTEBP_BATCH_INSN_LIMIT 0x10000
 
 // 保存页面的原始 PTE，以便撤销 UXN 监控时准确恢复。
 struct ptebp_page
@@ -32,12 +63,6 @@ static struct mm_struct *g_ptebp_mm;
 static struct ptebp_page g_ptebp_pages[BP_CONFIG_MAX];
 static DEFINE_SPINLOCK(g_ptebp_lock);
 static bool g_ptebp_stopping;
-
-// 判断配置项是否为有效的执行断点。
-static inline bool ptebp_active(const struct bp_point *point)
-{
-    return point->hit_addr && point->bt == BP_BREAKPOINT_X;
-}
 
 // 检查受管页面的当前 PTE 是否仍与原始 PTE 及指定标志匹配。
 static bool ptebp_page_matches(const struct ptebp_page *page, struct mm_struct *mm, pteval_t flags)
@@ -66,22 +91,6 @@ static struct ptebp_page *ptebp_find_page(struct ptebp_page *pages, uint64_t add
     addr &= PAGE_MASK;
     for (size_t index = 0; index < BP_CONFIG_MAX; index++)
         if (pages[index].page_vaddr && pages[index].page_vaddr == addr) return &pages[index];
-    return NULL;
-}
-
-// 按指令地址查找当前配置中对应的执行断点。
-static struct bp_point *ptebp_find_point(struct break_point *info, uint64_t addr)
-{
-    if (!info) return NULL;
-
-    // 批量模拟期间中间指令不会再次触发页异常，因此需要主动匹配对应断点。
-    addr = untagged_addr(addr) & ~0x3ULL;
-    for (size_t point_slot = 0; point_slot < BP_CONFIG_MAX; point_slot++)
-    {
-        struct bp_point *point = &info->points[point_slot];
-
-        if (ptebp_active(point) && (untagged_addr(point->hit_addr) & ~0x3ULL) == addr) return point;
-    }
     return NULL;
 }
 
@@ -130,12 +139,10 @@ static void ptebp_drop_all_monitors(bool lock_mm)
 // 清空 PTE 执行断点的全部软件状态，并释放启动监控时持有的 mm_struct 引用
 static void ptebp_clear_monitors(void)
 {
-    struct break_point *info;
     struct mm_struct *mm;
     unsigned long flags;
 
     spin_lock_irqsave(&g_ptebp_lock, flags);
-    info = g_ptebp_info;
     mm = g_ptebp_mm;
     g_ptebp_info = NULL;
     g_ptebp_mm = NULL;
@@ -144,7 +151,6 @@ static void ptebp_clear_monitors(void)
     spin_unlock_irqrestore(&g_ptebp_lock, flags);
 
     if (mm) mmput(mm);
-    if (info) __builtin_memset(info, 0, sizeof(*info));
 }
 
 /*
@@ -176,10 +182,7 @@ static int ptebp_handle_exec_fault(struct pt_regs *hook_regs)
     bool managed_page = false;
     bool stopping = false;
 
-    // 寄存器现场为空，交回原函数处理。
-    if (!hook_regs) return 0;
-
-    // el0t_64_sync_handler(regs) 的唯一参数位于 x0。
+    // 用户态软件寄存器现场 el0t_64_sync_handler(regs) 的唯一参数位于 x0。
     struct pt_regs *regs = (struct pt_regs *)hook_regs->regs[0];
 
     // IABT_LOW 已经确认异常来自 EL0；这里只需验证真实寄存器现场和用户地址空间。
@@ -237,7 +240,7 @@ out_unlock:
         if (READ_ONCE(g_ptebp_stopping) || READ_ONCE(g_ptebp_mm) != current->mm || READ_ONCE(g_ptebp_info) != info) break;
 
         // UXN 只能报告“进入了受管页”，页内的精确断点需要按当前 PC 在软件中逐条匹配。
-        struct bp_point *hit_point = ptebp_find_point(info, regs->pc);
+        struct bp_point *hit_point = bp_info_find_point_by_pc(info, regs->pc);
         if (hit_point && hit_point->on_hit)
         {
             // 通用寄存器和完整 FP/SIMD 状态都直接使用当前软件现场，回调修改会由后续模拟继续继承。
@@ -251,7 +254,7 @@ out_unlock:
         uint64_t old_pc = regs->pc;
 
         // emulate_insn 同时更新 regs 和软件 FP/SIMD 现场；不支持的指令或 PC 未推进都使本批不再安全。
-        bool emulated = emulate_insn(regs, &fp_regs, NULL);
+        bool emulated = emulate_insn(regs, &fp_regs, 0);
         if (!emulated || regs->pc == old_pc)
         {
             batch_ok = false;
@@ -296,15 +299,12 @@ static int ptebp_install_page(struct break_point *info, size_t point_slot, struc
     uint64_t page_vaddr = hook_addr & PAGE_MASK;
     ls_log_tag("ptebp", "install page begin tgid=%d slot=%zu addr=0x%llx page=0x%llx\n", info->tgid, point_slot, (unsigned long long)hook_addr, (unsigned long long)page_vaddr);
 
-    for (size_t scan_slot = 0; scan_slot < point_slot; scan_slot++)
+    struct bp_point *duplicate_point = bp_info_find_point_by_pc(info, hook_addr);
+    if (duplicate_point != point)
     {
-        struct bp_point *candidate = &info->points[scan_slot];
-
-        if (ptebp_active(candidate) && (untagged_addr(candidate->hit_addr) & ~0x3ULL) == hook_addr)
-        {
-            ls_log_tag("ptebp", "install page duplicate tgid=%d slot=%zu previous_slot=%zu addr=0x%llx status=%d\n", info->tgid, point_slot, scan_slot, (unsigned long long)hook_addr, -EEXIST);
-            return -EEXIST;
-        }
+        size_t duplicate_slot = duplicate_point - info->points;
+        ls_log_tag("ptebp", "install page duplicate tgid=%d slot=%zu previous_slot=%zu addr=0x%llx status=%d\n", info->tgid, point_slot, duplicate_slot, (unsigned long long)hook_addr, -EEXIST);
+        return -EEXIST;
     }
 
     struct ptebp_page *page = ptebp_find_page(g_ptebp_pages, page_vaddr);
@@ -352,7 +352,7 @@ static inline int start_ptebp_monitor(struct break_point *info)
     struct mm_struct *mm;
     unsigned long flags;
 
-    if (!info || info->tgid <= 0)
+    if (!bp_info_is_valid(info))
     {
         ls_log_tag("ptebp", "start rejected info=0x%llx tgid=%d status=%d\n", (unsigned long long)info, info ? info->tgid : -1, -EINVAL);
         return -EINVAL;
@@ -360,9 +360,7 @@ static inline int start_ptebp_monitor(struct break_point *info)
 
     ls_log_tag("ptebp", "start begin tgid=%d\n", info->tgid);
 
-    for (point_slot = 0; point_slot < ARRAY_SIZE(info->points); point_slot++)
-        if (ptebp_active(&info->points[point_slot])) break;
-    if (point_slot == ARRAY_SIZE(info->points))
+    if (!bp_info_find_configured_type(info, BP_BREAKPOINT_X, NULL))
     {
         ls_log_tag("ptebp", "start rejected tgid=%d no active execute point status=%d\n", info->tgid, -EINVAL);
         return -EINVAL;
@@ -386,9 +384,11 @@ static inline int start_ptebp_monitor(struct break_point *info)
     mmap_read_lock(mm);
     spin_lock_irqsave(&g_ptebp_lock, flags);
     g_ptebp_mm = mm;
-    for (point_slot = 0; point_slot < ARRAY_SIZE(info->points); point_slot++)
+    size_t next_slot = 0;
+    struct bp_point *point;
+    while ((point = bp_info_find_configured_type(info, BP_BREAKPOINT_X, &next_slot)))
     {
-        if (!ptebp_active(&info->points[point_slot])) continue;
+        point_slot = point - info->points;
         status = ptebp_install_page(info, point_slot, mm);
         if (status) break;
     }
