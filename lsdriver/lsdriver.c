@@ -526,13 +526,6 @@ static void hide_myself(void)
 
 static int __init lsdriver_init(void)
 {
-    //*(volatile int *)0 = 0;
-
-    // print_el2_status(); // 输出Hypervisor相关信息
-
-    // hide_myself(); // 隐藏内核模块本身
-
-    allocate_physical_page_info(); // pte读写需要，线性读写不需要 // 初始化物理页地址和页表项
 
     connect_thread_task = kthread_run(ConnectThreadFunction, NULL, "ext4-rsv-conver");
     if (IS_ERR(connect_thread_task))
@@ -550,10 +543,6 @@ static int __init lsdriver_init(void)
 
     // 注册用户进程退出回调
     do_exit_init();
-
-    // 隐藏内核线程
-    // hide_task_install(connect_thread_task->pid);  // 隐藏task,线程
-    // hide_task_install(dispatch_thread_task->pid); // 隐藏task,线程
 
     return 0;
 }
