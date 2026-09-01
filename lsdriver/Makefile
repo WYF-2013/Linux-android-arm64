@@ -23,6 +23,12 @@ $(obj)/lsdriver_main.o: $(src)/lsdriver.c FORCE
 #O3优化:启用更积极的内联、循环变换、指令调度和常量传播。
 ccflags-y += -O3
 
+# 覆盖内核全局的 -g(完整 DWARF)：-g1 只保留行号级调试信息，去掉本模块 -O3+Full LTO
+# 生成的海量类型/内联 DWARF。prebuilt pahole v1.23 为该模块生成 split BTF 时会段错误，
+# 而 -g1 仍保留最小 .debug_info，modfinal 的 pahole -J 可正常完成；ccflags-y 排在
+# KBUILD_CFLAGS 之后追加，编译行中 -g1 覆盖前者的级别限定。
+ccflags-y += -g1
+
 # Full LTO：让主驱动与 decoder/encoder 在统一模块视图中进行跨文件内联和常量传播。
 ccflags-y += -flto
 
