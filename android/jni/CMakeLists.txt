@@ -43,6 +43,18 @@ unset(_lang)
 
 project(LS_KTool LANGUAGES C CXX)
 
+# ============================================================================
+#  源码路径脱敏 (-ffile-prefix-map)
+# ----------------------------------------------------------------------------
+#  __FILE__/assert/日志/调试信息会内嵌编译机绝对路径 (如 C:/Users/xxx/...),
+#  发布产物前必须抹掉。这里把源码目录与构建目录统一映射为相对前缀 ".",
+#  Debug(-g3) 与 Release 均生效, 对本目录所有 target (含 capstone/imgui) 生效。
+# ============================================================================
+add_compile_options(
+    "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}/=."
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}/=."
+)
+
 # C++ 标准设置为 C++26 (保留原 Android.mk 的 -std=c++26)。
 # 注意: CMake < 3.25 不识别 "CXX26" dialect, 在 project() 期间就会因
 # CMAKE_CXX_STANDARD=26 而报错 "requires the language dialect CXX26 ... CMake
@@ -203,6 +215,42 @@ target_link_libraries(LS_KTool PRIVATE
     # 系统库 (c++_static STL 由工具链默认提供, 这里补 POSIX/数学依赖)
     m dl z
 )
+
+# ============================================================================
+#  自动 strip —— POST_BUILD 调 llvm-strip 剥离符号表/调试信息
+# ----------------------------------------------------------------------------
+#  未 strip 的产物体积约 2.5x, 且符号表内嵌编译机路径。strip 工具优先取
+#  工具链的 CMAKE_STRIP (NDK 下即 llvm-strip), 否则在编译器同目录查找。
+#  cmake -DLS_KTOOL_STRIP=0 可保留符号用于现场调试 (需自行脱敏后再发布)。
+# ============================================================================
+set(LS_KTOOL_STRIP 1 CACHE STRING "Strip LS_KTool after build (1=on, 0=off)")
+if (LS_KTOOL_STRIP)
+    set(_LS_STRIP_HINTS)
+    if (CMAKE_STRIP)
+        get_filename_component(_LS_STRIP_BINUTIL_DIR "${CMAKE_STRIP}" DIRECTORY)
+        list(APPEND _LS_STRIP_HINTS "${_LS_STRIP_BINUTIL_DIR}")
+        unset(_LS_STRIP_BINUTIL_DIR)
+    endif ()
+    get_filename_component(_LS_CC_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    list(APPEND _LS_STRIP_HINTS "${_LS_CC_DIR}")
+    unset(_LS_CC_DIR)
+    find_program(LS_KTOOL_STRIP_EXE
+        NAMES llvm-strip
+        HINTS ${_LS_STRIP_HINTS}
+    )
+    unset(_LS_STRIP_HINTS)
+    if (LS_KTOOL_STRIP_EXE)
+        add_custom_command(TARGET LS_KTool POST_BUILD
+            COMMAND "${LS_KTOOL_STRIP_EXE}" --strip-all $<TARGET_FILE:LS_KTool>
+            COMMENT "Stripping $<TARGET_FILE_NAME:LS_KTool> (llvm-strip)"
+            VERBATIM
+        )
+    else ()
+        message(WARNING
+            "llvm-strip 未找到, LS_KTool 构建后不会被 strip。"
+            "请改用 NDK 工具链构建, 或构建后手动 strip。")
+    endif ()
+endif ()
 
 # ============================================================================
 #  adb 推送目标 —— 对应原 Android.mk 111-124 行的 push-akernel
