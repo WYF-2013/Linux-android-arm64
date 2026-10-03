@@ -36,14 +36,14 @@ git submodule update --init android/jni/capstone android/jni/imgui android/jni/j
 
 ### 编译 LS_KTool（用户态程序）
 
-使用 CMake + Android NDK 交叉编译：
+使用 CMake + Android NDK 交叉编译。NDK 路径、ABI、目标 API 已在
+`android/jni/CMakeLists.txt` 顶部提供默认值（当前：NDK r30、arm64-v8a、
+Android 35），不传 toolchain 参数时自动生效：
 
 ```bash
-# 前置条件：NDK r27d、CMake 3.22+、Ninja
+# 前置条件：NDK r30（默认路径 D:/android-ndk-r30，可用 -DCMAKE_ANDROID_NDK 覆盖）、
+#           CMake 3.22+、Ninja
 cmake -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=<NDK>/build/cmake/android.toolchain.cmake \
-  -DANDROID_ABI=arm64-v8a \
-  -DANDROID_PLATFORM=android-26 \
   -DCMAKE_BUILD_TYPE=Release \
   -S android/jni \
   -B build
@@ -51,7 +51,22 @@ cmake -G Ninja \
 cmake --build build -j$(nproc)
 ```
 
-产物：`build/LS_KTool`（ARM aarch64 ELF 可执行文件）
+需要指定其它 NDK 或调整 ABI / 目标 API 时，显式传入 NDK 官方 toolchain
+文件（此时 CMakeLists 内的默认值不生效）：
+
+```bash
+cmake -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=<NDK>/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-26 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -S android/jni \
+  -B build
+```
+
+产物：`build/LS_KTool`（ARM aarch64 ELF 可执行文件）。Release 构建会自动
+`llvm-strip` 剥符号，并通过 `-ffile-prefix-map` 抹掉产物内的编译机绝对路径；
+需要保留符号调试时加 `-DLS_KTOOL_STRIP=0`。
 
 ### 编译 Windows 端程序
 

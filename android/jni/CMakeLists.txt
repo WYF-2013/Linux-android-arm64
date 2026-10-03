@@ -12,7 +12,7 @@ cmake_minimum_required(VERSION 3.22)
 #  仅当外部未提供 CMAKE_ANDROID_NDK 时填充默认值, 避免覆盖外部传参。
 # ============================================================================
 if (NOT DEFINED CMAKE_ANDROID_NDK AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
-    set(CMAKE_ANDROID_NDK D:/android-ndk-r27d)
+    set(CMAKE_ANDROID_NDK D:/android-ndk-r30)
     set(CMAKE_SYSTEM_NAME Android)
     set(CMAKE_SYSTEM_VERSION 35)
     set(CMAKE_ANDROID_ARCH_ABI arm64-v8a)
